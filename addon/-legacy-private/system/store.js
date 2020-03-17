@@ -11,7 +11,6 @@ import { assign } from '@ember/polyfills';
 import { default as RSVP, Promise } from 'rsvp';
 import Service from '@ember/service';
 import { typeOf, isPresent, isNone } from '@ember/utils';
-
 import Ember from 'ember';
 import { InvalidError } from '../adapters/errors';
 import { instrument } from 'ember-data/-debug';
@@ -23,13 +22,7 @@ import IdentityMap from './identity-map';
 
 import { promiseArray, promiseObject } from './promise-proxies';
 
-import {
-  _bind,
-  _guard,
-  _objectIsAlive,
-  guardDestroyedStore,
-  incrementRequestCount,
-} from './store/common';
+import { _bind, _guard, _objectIsAlive, guardDestroyedStore } from './store/common';
 
 import { normalizeResponseHelper } from './store/serializer-response';
 import { serializerForAdapter } from './store/serializers';
@@ -225,6 +218,58 @@ Store = Service.extend({
 
     this._adapterCache = Object.create(null);
     this._serializerCache = Object.create(null);
+
+    if (DEBUG) {
+      if (this.shouldTrackAsyncRequests === undefined) {
+        this.shouldTrackAsyncRequests = false;
+      }
+      if (this.generateStackTracesForTrackedRequests === undefined) {
+        this.generateStackTracesForTrackedRequests = false;
+      }
+
+      this._trackedAsyncRequests = [];
+      this._trackAsyncRequestStart = label => {
+        let trace =
+          'set `store.generateStackTracesForTrackedRequests = true;` to get a detailed trace for where this request originated';
+
+        if (this.generateStackTracesForTrackedRequests) {
+          try {
+            throw new Error(`EmberData TrackedRequest: ${label}`);
+          } catch (e) {
+            trace = e;
+          }
+        }
+
+        let token = Object.freeze({
+          label,
+          trace,
+        });
+
+        this._trackedAsyncRequests.push(token);
+        return token;
+      };
+      this._trackAsyncRequestEnd = token => {
+        let index = this._trackedAsyncRequests.indexOf(token);
+
+        if (index === -1) {
+          throw new Error(
+            `Attempted to end tracking for the following request but it was not being tracked:\n${token}`
+          );
+        }
+
+        this._trackedAsyncRequests.splice(index, 1);
+      };
+
+      this.__asyncWaiter = () => {
+        let shouldTrack = this.shouldTrackAsyncRequests;
+        let tracked = this._trackedAsyncRequests;
+        let isSettled = tracked.length === 0;
+
+        return shouldTrack !== true || isSettled;
+      };
+
+      Ember.Test.registerWaiter(this.__asyncWaiter);
+    }
   },
 
   /**
@@ -830,6 +875,24 @@ Store = Service.extend({
       resolver,
       options,
     };
+
+    if (DEBUG) {
+      if (this.generateStackTracesForTrackedRequests === true) {
+        let trace;
+
+        try {
+          throw new Error(`Trace Origin for scheduled fetch for ${modelName}:${id}.`);
+        } catch (e) {
+          trace = e;
+        }
+
+        // enable folks to discover the origin of this findRecord call when
+        // debugging. Ideally we would have a tracked queue for requests with
+        // labels or local IDs that could be used to merge this trace with
+        // the trace made available when we detect an async leak
+        pendingFetchItem.trace = trace;
+      }
+    }
 
     let promise = resolver.promise;
 
@@ -2829,6 +2892,31 @@ Store = Service.extend({
     this._serializerCache = null;
 
     this.unloadAll();
+
+    if (DEBUG) {
+      Ember.Test.unregisterWaiter(this.__asyncWaiter);
+      let shouldTrack = this.shouldTrackAsyncRequests;
+      let tracked = this._trackedAsyncRequests;
+      let isSettled = tracked.length === 0;
+
+      if (!isSettled) {
+        if (shouldTrack) {
+          throw new Error(
+            'Async Request leaks detected. Add a breakpoint here and set `store.generateStackTracesForTrackedRequests = true;`to inspect traces for leak origins:\n\t - ' +
+              tracked.map(o => o.label).join('\n\t - ')
+          );
+        } else {
+          warn(
+            'Async Request leaks detected. Add a breakpoint here and set `store.generateStackTracesForTrackedRequests = true;`to inspect traces for leak origins:\n\t - ' +
+              tracked.map(o => o.label).join('\n\t - '),
+            false,
+            {
+              id: 'ds.async.leak.detected',
+            }
+          );
+        }
+      }
+    }
   },
 
   _updateRelationshipState(relationship) {
@@ -2922,10 +3010,6 @@ function _commit(adapter, store, operation, snapshot) {
     `You tried to update a record but your adapter (for ${modelName}) does not implement '${operation}'`,
     typeof adapter[operation] === 'function'
   );
-
-  if (DEBUG) {
-    incrementRequestCount();
-  }
 
   let promise = Promise.resolve().then(() => adapter[operation](store, modelClass, snapshot));
   let serializer = serializerForAdapter(store, adapter, modelName);
@@ -3035,11 +3119,11 @@ function isInverseRelationshipInitialized(store, internalModel, data, key, model
 }
 
 /**
- *
+ * @function
  * @param store
  * @param cache modelFactoryCache
  * @param normalizedModelName already normalized modelName
- * @returns {*}
+ * @return {*}
  */
 function getModelFactory(store, cache, normalizedModelName) {
   let factory = cache[normalizedModelName];
@@ -3156,7 +3240,7 @@ function setupRelationships(store, internalModel, data, modelNameToInverseMap) {
         warn(
           `You pushed a record of type '${
             internalModel.modelName
-          }' with a relationship '${relationshipName}' configured as 'async: false'. You've included a link but no primary data, this may be an error in your payload.`,
+          }' with a relationship '${relationshipName}' configured as 'async: false'. You've included a link but no primary data, this may be an error in your payload. EmberData will treat this relationship as known-to-be-empty.`,
           isAsync || relationshipData.data,
           {
             id: 'ds.store.push-link-for-sync-relationship',

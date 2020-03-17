@@ -4,7 +4,7 @@
 import { A } from '@ember/array';
 import EmberError from '@ember/error';
 import MapWithDefault from './map-with-default';
-import { run as emberRun } from '@ember/runloop';
+import { run as emberRunLoop } from '@ember/runloop';
 import { set, get, computed } from '@ember/object';
 import { assign } from '@ember/polyfills';
 import { default as RSVP, Promise } from 'rsvp';
@@ -23,13 +23,7 @@ import ModelDataWrapper from './store/model-data-wrapper';
 
 import { promiseArray, promiseObject } from './promise-proxies';
 
-import {
-  _bind,
-  _guard,
-  _objectIsAlive,
-  guardDestroyedStore,
-  incrementRequestCount,
-} from './store/common';
+import { _bind, _guard, _objectIsAlive, guardDestroyedStore } from './store/common';
 
 import { normalizeResponseHelper } from './store/serializer-response';
 import { serializerForAdapter } from './store/serializers';
@@ -52,6 +46,7 @@ import ModelData from './model/model-data';
 import edBackburner from './backburner';
 
 const badIdFormatAssertion = '`id` passed to `findRecord()` has to be non-empty string or number';
+const emberRun = emberRunLoop.backburner;
 
 const { ENV } = Ember;
 let globalClientIdCounter = 1;
@@ -229,6 +224,58 @@ Store = Service.extend({
     this._serializerCache = Object.create(null);
 
     this.modelDataWrapper = new ModelDataWrapper(this);
+
+    if (DEBUG) {
+      if (this.shouldTrackAsyncRequests === undefined) {
+        this.shouldTrackAsyncRequests = false;
+      }
+      if (this.generateStackTracesForTrackedRequests === undefined) {
+        this.generateStackTracesForTrackedRequests = false;
+      }
+
+      this._trackedAsyncRequests = [];
+      this._trackAsyncRequestStart = label => {
+        let trace =
+          'set `store.generateStackTracesForTrackedRequests = true;` to get a detailed trace for where this request originated';
+
+        if (this.generateStackTracesForTrackedRequests) {
+          try {
+            throw new Error(`EmberData TrackedRequest: ${label}`);
+          } catch (e) {
+            trace = e;
+          }
+        }
+
+        let token = Object.freeze({
+          label,
+          trace,
+        });
+
+        this._trackedAsyncRequests.push(token);
+        return token;
+      };
+      this._trackAsyncRequestEnd = token => {
+        let index = this._trackedAsyncRequests.indexOf(token);
+
+        if (index === -1) {
+          throw new Error(
+            `Attempted to end tracking for the following request but it was not being tracked:\n${token}`
+          );
+        }
+
+        this._trackedAsyncRequests.splice(index, 1);
+      };
+
+      this.__asyncWaiter = () => {
+        let shouldTrack = this.shouldTrackAsyncRequests;
+        let tracked = this._trackedAsyncRequests;
+        let isSettled = tracked.length === 0;
+
+        return shouldTrack !== true || isSettled;
+      };
+
+      Ember.Test.registerWaiter(this.__asyncWaiter);
+    }
   },
 
   /**
@@ -838,6 +885,24 @@ Store = Service.extend({
       options,
     };
 
+    if (DEBUG) {
+      if (this.generateStackTracesForTrackedRequests === true) {
+        let trace;
+
+        try {
+          throw new Error(`Trace Origin for scheduled fetch for ${modelName}:${id}.`);
+        } catch (e) {
+          trace = e;
+        }
+
+        // enable folks to discover the origin of this findRecord call when
+        // debugging. Ideally we would have a tracked queue for requests with
+        // labels or local IDs that could be used to merge this trace with
+        // the trace made available when we detect an async leak
+        pendingFetchItem.trace = trace;
+      }
+    }
+
     let promise = resolver.promise;
 
     internalModel.loadingData(promise);
@@ -1299,10 +1364,8 @@ Store = Service.extend({
       );
     }
 
-    let preferLocalCache =
-      hasAnyRelationshipData &&
-      // allInverseRecordsAreLoaded &&
-      !relationshipIsEmpty;
+    let preferLocalCache = hasAnyRelationshipData && !relationshipIsEmpty;
+
     let hasLocalPartialData =
       hasDematerializedInverse ||
       (relationshipIsEmpty && Array.isArray(resource.data) && resource.data.length > 0);
@@ -1384,6 +1447,7 @@ Store = Service.extend({
       return RSVP.resolve(null);
     }
 
+    let internalModel = resource.data ? this._internalModelForResource(resource.data) : null;
     let {
       relationshipIsStale,
       allInverseRecordsAreLoaded,
@@ -1399,6 +1463,13 @@ Store = Service.extend({
         relationshipIsStale ||
         (!allInverseRecordsAreLoaded && !relationshipIsEmpty));
 
+    // short circuit if we are already loading
+    if (internalModel && internalModel.isLoading()) {
+      return internalModel._promiseProxy.then(() => {
+        return internalModel.getRecord();
+      });
+    }
+
     // fetch via link
     if (shouldFindViaLink) {
       return this._fetchBelongsToLinkFromResource(resource, parentInternalModel, relationshipMeta);
@@ -1407,28 +1478,29 @@ Store = Service.extend({
     let preferLocalCache =
       hasAnyRelationshipData && allInverseRecordsAreLoaded && !relationshipIsEmpty;
     let hasLocalPartialData = hasDematerializedInverse || (relationshipIsEmpty && resource.data);
+    // null is explicit empty, undefined is "we don't know anything"
+    let localDataIsEmpty = resource.data === undefined || resource.data === null;
 
     // fetch using data, pulling from local cache if possible
     if (!relationshipIsStale && (preferLocalCache || hasLocalPartialData)) {
-      let internalModel = this._internalModelForResource(resource.data);
+      /*
+        We have canonical data, but our local state is empty
+       */
+      if (localDataIsEmpty) {
+        return RSVP.resolve(null);
+      }
 
       return this._findByInternalModel(internalModel);
     }
 
-    // null is explicit empty, undefined is "we don't know anything"
-    let localDataIsEmpty = resource.data === undefined || resource.data === null;
     let resourceIsLocal = !localDataIsEmpty && resource.data.id === null;
 
     if (resourceIsLocal) {
-      let internalModel = this._internalModelForResource(resource.data);
-
       return RSVP.resolve(internalModel.getRecord());
     }
 
     // fetch by data
     if (!localDataIsEmpty) {
-      let internalModel = this._internalModelForResource(resource.data);
-
       return this._fetchRecord(internalModel).then(() => {
         return internalModel.getRecord();
       });
@@ -2028,7 +2100,7 @@ Store = Service.extend({
       snapshot: snapshot,
       resolver: resolver,
     });
-    emberRun.once(this, this.flushPendingSave);
+    emberRun.scheduleOnce('actions', this, this.flushPendingSave);
   },
 
   /**
@@ -3048,6 +3120,31 @@ Store = Service.extend({
     this._serializerCache = null;
 
     this.unloadAll();
+
+    if (DEBUG) {
+      Ember.Test.unregisterWaiter(this.__asyncWaiter);
+      let shouldTrack = this.shouldTrackAsyncRequests;
+      let tracked = this._trackedAsyncRequests;
+      let isSettled = tracked.length === 0;
+
+      if (!isSettled) {
+        if (shouldTrack) {
+          throw new Error(
+            'Async Request leaks detected. Add a breakpoint here and set `store.generateStackTracesForTrackedRequests = true;`to inspect traces for leak origins:\n\t - ' +
+              tracked.map(o => o.label).join('\n\t - ')
+          );
+        } else {
+          warn(
+            'Async Request leaks detected. Add a breakpoint here and set `store.generateStackTracesForTrackedRequests = true;`to inspect traces for leak origins:\n\t - ' +
+              tracked.map(o => o.label).join('\n\t - '),
+            false,
+            {
+              id: 'ds.async.leak.detected',
+            }
+          );
+        }
+      }
+    }
   },
 
   _updateRelationshipState(relationship) {
@@ -3148,10 +3245,6 @@ function _commit(adapter, store, operation, snapshot) {
     typeof adapter[operation] === 'function'
   );
 
-  if (DEBUG) {
-    incrementRequestCount();
-  }
-
   let promise = Promise.resolve().then(() => adapter[operation](store, modelClass, snapshot));
   let serializer = serializerForAdapter(store, adapter, modelName);
   let label = `DS: Extract and notify about ${operation} completion of ${internalModel}`;
@@ -3220,7 +3313,7 @@ function _commit(adapter, store, operation, snapshot) {
  * @param store
  * @param cache modelFactoryCache
  * @param normalizedModelName already normalized modelName
- * @returns {*}
+ * @return {*}
  */
 function getModelFactory(store, cache, normalizedModelName) {
   let factory = cache[normalizedModelName];
